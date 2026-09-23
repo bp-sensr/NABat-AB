@@ -1,6 +1,7 @@
 # read the bat detection data base
 library(tidyverse)
 
+
 #speciesdetails <- readxl::read_excel(file.path("..","Data","Grid Cell Comments.xlsx"),
 #                               sheet="SpeciesDetails",
 #                               .name_repair='universal')
@@ -28,6 +29,9 @@ library(tidyverse)
                              # sheet="OccupancyNoID",
                             # sheet="Occupancy",
                              #.name_repair='universal')
+
+load("Data/analysis_list.RData") #load the RData file from Alberto as a temp data file while I clean up the AB dataset
+
 
 bat.data <- readxl::read_excel("V:/ARU/SENSR-BAT/NABat/2025/AK/Analyzed/All Year Activity by Night 2016-2025 AK-Aug19.xlsx",
                                sheet="OccupancyKSP",

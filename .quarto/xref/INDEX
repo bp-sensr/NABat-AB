@@ -5,5 +5,9 @@
   },
   "AK-reportV1.qmd": {
     "AK-reportV1.html": "d18d767c"
+  },
+  "test.qmd": {
+    "test.html": "605d3713",
+    "test.tex": "01e75a29"
   }
 }
