@@ -850,7 +850,7 @@ Where possible, driving transects were conducted following @loeb2015. Bats were 
 
 ### Landscape and Weather Covariates
 
-We considered the same covariates for the activity trend models as those previously established in British Columbia \[@rae2024\]. Temperature and relative humidity were drawn from the nearest climate station. Site-level covariates were derived from GIS (elevation, distance to water, water body type) or recorded by grid leaders during deployment (distance to clutter, percent clutter).
+We considered the same covariates for the activity trend models as those previously established in British Columbia [@rae2024]. Temperature and relative humidity were drawn from the nearest climate station. Site-level covariates were derived from GIS (elevation, distance to water, water body type) or recorded by grid leaders during deployment (distance to clutter, percent clutter).
 
 We explored additional factors influencing colonization and extinction in the dynamic occupancy models. For those models we included distance to the nearest road, and distance to timber harvest, calculated as the distance from each survey location to the closest road or harvest feature. Road and harvest features were derived from the Human Footprint Index (HFI) published by ABMI.
 
