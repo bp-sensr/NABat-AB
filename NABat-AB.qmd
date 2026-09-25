@@ -977,6 +977,8 @@ if (is_html) {
 
 ## Activity and Abundance Trends
 
+...
+
 ### Covariate Effects
 
 ## Dynamic Occupancy
