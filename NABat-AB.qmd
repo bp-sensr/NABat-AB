@@ -39,6 +39,8 @@ author:
     affiliation: "Biodiversity Pathways"
 editor: visual
 bibliography: references.bib
+resources:
+  - popup_figs/
 nocite: '@*'
 ---
 
@@ -257,6 +259,7 @@ n_more_than_3<- sum(grid_years$n_years > 3) #grid with long term potential
 library(stringr)
 library(leaflet)
 library(htmltools)
+library(svglite)
 
 # ---- 0. Settings -----------------------------------------------------------
 # Fixed colour per species so every pie is consistent.
@@ -710,6 +713,35 @@ build_popup <- function(site_name, comment = NA,
 }
 
 #----------------Create the map-----------------------
+# Folder is relative to the qmd / rendered html
+fig_dir <- "popup_figs"
+dir.create(fig_dir, showWarnings = FALSE)
+
+# Pull width/height off the <svg> tag so the <img> is sized identically
+svg_dims <- function(svg) {
+  w <- as.numeric(sub('^<svg[^>]*? width="([0-9.]+)".*$',  "\\1", svg, perl = TRUE))
+  h <- as.numeric(sub('^<svg[^>]*? height="([0-9.]+)".*$', "\\1", svg, perl = TRUE))
+  c(w = w, h = h)
+}
+
+# Save an SVG string to disk and return an <img> tag pointing at it.
+#   as_png = FALSE -> writes .svg (tiny + crisp; good for pies and bar charts)
+#   as_png = TRUE  -> writes .png at 2x (much smaller for the dense hour plot)
+svg_to_img <- function(svg, name, as_png = FALSE) {
+  d    <- svg_dims(svg)
+  name <- gsub("[^A-Za-z0-9_-]", "_", name)
+  if (as_png) {
+    file <- file.path(fig_dir, paste0(name, ".png"))
+    rsvg::rsvg_png(charToRaw(svg), file, width = 2 * d[["w"]], height = 2 * d[["h"]])
+  } else {
+    file <- file.path(fig_dir, paste0(name, ".svg"))
+    writeLines(svg, file, useBytes = TRUE)
+  }
+  sprintf('<img src="%s" width="%g" height="%g" style="display:block;max-width:none;">',
+          file, d[["w"]], d[["h"]])
+}
+
+#----------------Create the map-----------------------
 map_data$popup <- vapply(seq_len(nrow(map_data)), function(i) {
   site_key <- map_data$Site_key[i]
   
@@ -728,17 +760,27 @@ map_data$popup <- vapply(seq_len(nrow(map_data)), function(i) {
   yrs_here <- plot_years[vapply(plot_years,
                                 function(y) sum(counts_year(site_key, y)) > 0,
                                 logical(1))]
-  pie_svg <- if (length(yrs_here) == 0) make_pie_svg(numeric(0)) else
+  pie_html <- if (length(yrs_here) == 0) {
+    svg_to_img(make_pie_svg(numeric(0)), paste0(site_key, "_pie_none"))
+  } else {
     paste(vapply(sort(yrs_here, decreasing = TRUE), function(y) {
       sprintf('<div style="font-weight:bold;font-size:12px;color:#2c3e50;margin:6px 0 2px;">%s</div>%s',
-              y, make_pie_svg(counts_year(site_key, y)))
+              y,
+              svg_to_img(make_pie_svg(counts_year(site_key, y)),
+                         paste0(site_key, "_pie_", y)))
     }, character(1)), collapse = "")
+  }
   
-  ts_svg <- make_dayseries_year_svg(sd_i, year_cols = year_cols,
-                                    xlim = site_day_xlim, ylab = day_ylab)
-  hr_svg <- make_hourfacet_svg(pts_i, ylim = hour_ylim, year_cols = year_cols)
+  ts_html <- svg_to_img(
+    make_dayseries_year_svg(sd_i, year_cols = year_cols,
+                            xlim = site_day_xlim, ylab = day_ylab),
+    paste0(site_key, "_date"))
   
-  build_popup(map_data$Site[i], map_data$Comment[i], pie_svg, ts_svg, hr_svg)
+  hr_html <- svg_to_img(
+    make_hourfacet_svg(pts_i, ylim = hour_ylim, year_cols = year_cols),
+    paste0(site_key, "_hour"), as_png = TRUE)
+  
+  build_popup(map_data$Site[i], map_data$Comment[i], pie_html, ts_html, hr_html)
 }, character(1))
 
 map_data <- map_data %>%
