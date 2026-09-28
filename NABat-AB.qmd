@@ -108,17 +108,17 @@ parse_time <- function(x) {
                   quiet = TRUE)
 }
 
-# temp_all: rename to match temp2024 and rebuild missing columns
-all_fmt <- temp_all %>%
+# temp_all: rename to match temp2024 and temp2025 and rebuild missing columns
+all_fmt <- temp_merged %>%
   transmute(
-    X..GRTS.Cell.Id      = sub("_.*", "", X..Location.Name),                    # "139715"
-    Grid.Cell.Quadrant   = sub("^[^_]+_([^_]+)_.*", "\\1", X..Location.Name),   # "NE"
+    X..GRTS.Cell.Id      = sub("_.*", "", X..Location.Name), 
+    Grid.Cell.Quadrant   = sub("^[^_]+_([^_]+)_.*", "\\1", X..Location.Name),
     Surveyor.s.          = NA_character_,
-    Latitude             = NA_real_,
-    Longitude            = NA_real_,
+    Latitude             = as.numeric(Latitude),
+    Longitude            = as.numeric(Longitude),
     Site.Name            = X..Location.Name,
-    Survey.Start.Time    = parse_time(Survey.Start.Time),
-    Survey.End.Time      = parse_time(Survey.End.Time),
+    Survey.Start.Time    = parse_time(Survey.Start.Time.x),
+    Survey.End.Time      = parse_time(Survey.End.Time.x),
     Auto.Id.Software     = Software.Type,
     Auto.Id              = as.character(Auto.Id),
     Manual.Id            = as.character(Manual.Id),
@@ -165,6 +165,22 @@ t25_fmt <- temp2025 %>%
 
 
 merged <- bind_rows(all_fmt, t24_fmt, t25_fmt)
+
+#make sure that the lat, long are the same for all the sites that are the same
+# lat/long from the earliest survey at each site (ignoring rows with missing coords)
+site_coords <- merged %>%
+  filter(!is.na(Survey.Start.Time), !is.na(Latitude), !is.na(Longitude)) %>%
+  arrange(Site.Name, Survey.Start.Time) %>%
+  distinct(Site.Name, .keep_all = TRUE) %>%
+  select(Site.Name, ref_lat = Latitude, ref_lon = Longitude)
+
+merged <- merged %>%
+  left_join(site_coords, by = "Site.Name") %>%
+  mutate(
+    Latitude  = coalesce(ref_lat, Latitude),
+    Longitude = coalesce(ref_lon, Longitude)
+  ) %>%
+  select(-ref_lat, -ref_lon)
 
 #clean up species codes
 # ---- Standardise species codes in Manual.Id and Auto.Id --------------------
@@ -238,9 +254,6 @@ n_more_than_3<- sum(grid_years$n_years > 3) #grid with long term potential
 #| warning: false
 #| message: false
 
-library(dplyr)
-library(tidyr)
-library(lubridate)
 library(stringr)
 library(leaflet)
 library(htmltools)
@@ -731,7 +744,9 @@ map_data$popup <- vapply(seq_len(nrow(map_data)), function(i) {
 map_data <- map_data %>%
   mutate(
     trend_cell = trimws(as.character(Cell)) %in% trimws(as.character(trend_grids$GRTS_Cell)),
-    fill_col   = ifelse(trend_cell, "#e31a1c", "#3498db")   # red vs blue
+    fill_col   = ifelse(trend_cell, "#e31a1c", "#3498db"),   # red vsblue
+    fill_opacity = ifelse(trend_cell, 0.9, 0.3),   # blue dots faded
+    line_opacity = ifelse(trend_cell, 1,   0.3)    # fade their outline too
   ) %>%
   arrange(trend_cell)            # red sites drawn last, so they sit on top
 
@@ -740,7 +755,8 @@ m <- leaflet(map_data) %>%
   addCircleMarkers(
     lng = ~Long, lat = ~Lat,
     radius = 6, color = "#2c3e50", weight = 1,
-    fillColor = ~fill_col, fillOpacity = 0.9,
+    opacity = ~line_opacity,
+    fillColor = ~fill_col, fillOpacity = ~fill_opacity,
     popup = ~popup, label = ~Site,
     popupOptions = popupOptions(maxWidth = 460, maxHeight = 560)
   ) %>%
@@ -944,8 +960,28 @@ if (is_html) {
   if (!dir.exists("Figures")) dir.create("Figures")
   map_png <- "Figures/site_summary_map.png"
   
-  m_static <- leaflet(map_data, options = leafletOptions(zoomControl = FALSE)) %>%
-    addProviderTiles(providers$CartoDB.Positron) %>%
+  # --- Bounding box of the sites, with a small buffer ---
+  lon_rng <- range(map_data$Long, na.rm = TRUE)
+  lat_rng <- range(map_data$Lat,  na.rm = TRUE)
+  pad_lon <- diff(lon_rng) * 0.03
+  pad_lat <- diff(lat_rng) * 0.03
+  lon_rng <- lon_rng + c(-pad_lon, pad_lon)
+  lat_rng <- lat_rng + c(-pad_lat, pad_lat)
+  
+  # --- Match screenshot aspect ratio to the data (Web Mercator) ---
+  merc_y   <- function(lat) log(tan(pi / 4 + lat * pi / 360))
+  x_extent <- diff(lon_rng) * pi / 180
+  y_extent <- diff(merc_y(lat_rng))
+  aspect   <- x_extent / y_extent          # width / height
+  
+  vheight <- 1000
+  vwidth  <- max(500, round(vheight * aspect))  # floor so the legend still fits
+  
+  m_static <- leaflet(
+    map_data,
+    options = leafletOptions(zoomControl = FALSE, zoomSnap = 0.1, zoomDelta = 0.1)
+  ) %>%
+    addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
     addCircleMarkers(
       lng = ~Long, lat = ~Lat,
       radius = 5, color = "#2c3e50", weight = 1,
@@ -958,17 +994,14 @@ if (is_html) {
       title    = "Monitoring sites",
       opacity  = 1
     ) %>%
-    fitBounds(
-      min(map_data$Long, na.rm = TRUE), min(map_data$Lat, na.rm = TRUE),
-      max(map_data$Long, na.rm = TRUE), max(map_data$Lat, na.rm = TRUE)
-    )
+    fitBounds(lon_rng[1], lat_rng[1], lon_rng[2], lat_rng[2])
   
   mapview::mapshot2(
     m_static,
     file    = map_png,
-    vwidth  = 900,   # render width in px  (controls aspect ratio)
-    vheight = 650,   # render height in px
-    delay   = 1.5    # give the basemap tiles time to load before capture
+    vwidth  = vwidth,
+    vheight = vheight,
+    delay   = 3      # a bit longer so all tiles finish loading
   )
   
   knitr::include_graphics(map_png)
@@ -1002,253 +1035,253 @@ Dynamic occupancy species specific results. Coming soon..
 #| message: false
 #| output: asis
 
-#this would create the interactive map images but to add in teh pdf. The prolem is that we are looking at hundreds of them, so it would make for a very long pdf. Need to thnk about how to do this
+# ---- Appendix B: per-grid-cell detection summaries, PDF only ---------------
+# For every GRTS cell: species pies per site, nightly activity by site, and
+# detection time of night by species/site -- one image per year, newest first.
+# Sites are grouped by their GRTS cell id (X..GRTS.Cell.Id), no shapefile needed.
+if (is_pdf) {
 
+  # ---- Settings ------------------------------------------------------------
+  appx_dir   <- "Figures/AppendixB"
+  appx_years <- NULL   # NULL = every year a cell has data; or e.g. c(2025, 2024)
+  appx_cells <- trimws(as.character(trend_grids$GRTS_Cell))   # NULL = every cell
+  if (!dir.exists(appx_dir)) dir.create(appx_dir, recursive = TRUE)
 
-# # ---- Appendix B: per-grid-cell detection summaries, PDF only ---------------
-# # For every GRTS cell: species pies per site, nightly activity by site, and
-# # detection time of night by species/site -- one image per year, newest first.
-# # Sites are grouped by their GRTS cell id (X..GRTS.Cell.Id), no shapefile needed.
-# if (is_pdf) {
-#   
-#   # ---- Settings ------------------------------------------------------------
-#   appx_dir   <- "Figures/AppendixB"
-#   appx_years <- NULL   # NULL = every year a cell has data; or e.g. c(2025, 2024)
-#   appx_cells <- NULL   # NULL = every cell; or e.g. trend_grids$GRTS_Cell
-#   if (!dir.exists(appx_dir)) dir.create(appx_dir, recursive = TRUE)
-#   
-#   site_palette <- c("#e41a1c", "#377eb8", "#4daf4a", "#984ea3",
-#                     "#ff7f00", "#a65628", "#f781bf", "#666666")
-#   
-#   page_css <- "body{margin:0;padding:12px;background:#fff;font-family:sans-serif;}
-#     .shot{display:inline-block;}
-#     .yearHdr{font-weight:bold;font-size:16px;color:#2c3e50;border-bottom:2px solid #ccc;margin:0 0 8px;padding-bottom:2px;}
-#     .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:#333;margin:0 0 6px 44px;}
-#     .legend span{display:inline-flex;align-items:center;gap:5px;}
-#     .legend i{display:inline-block;width:11px;height:11px;border-radius:2px;}
-#     .pieItem{display:inline-block;vertical-align:top;text-align:center;margin:6px;}
-#     .pieTitle{font-weight:bold;font-size:14px;color:#2c3e50;margin-bottom:2px;}"
-#   
-#   html_page <- function(body) sprintf(
-#     '<!DOCTYPE html><html><head><meta charset="utf-8"><style>%s</style></head><body><div class="shot">%s</div></body></html>',
-#     page_css, body)
-#   
-#   # site legend as HTML so long site names wrap instead of overlapping
-#   html_legend <- function(cols) sprintf('<div class="legend">%s</div>',
-#                                         paste(sprintf('<span><i style="background:%s"></i>%s</span>',
-#                                                       cols, htmltools::htmlEscape(names(cols))), collapse = ""))
-#   
-#   # ---- Bar chart: mean nightly recordings by date, bars dodged by site ------
-#   make_multisite_bar_svg <- function(dd, site_cols, width = 700L, height = 330L,
-#                                      font_size = 12, ylab = "Recordings / night") {
-#     sites <- names(site_cols)[names(site_cols) %in% dd$Site]; ns <- length(sites)
-#     ml <- 54; mr <- 16; mt <- 14; mb <- 54
-#     pw <- width - ml - mr; ph <- height - mt - mb
-#     
-#     maxv  <- max(dd$value, na.rm = TRUE); if (!is.finite(maxv) || maxv <= 0) maxv <- 1
-#     ticks <- pretty(c(0, maxv), n = 5); ytop <- max(ticks)
-#     
-#     days_u <- sort(unique(dd$day)); xr <- range(days_u); span <- as.numeric(diff(xr))
-#     pad <- max(1, span * 0.06); xlo <- xr[1] - pad; xhi <- xr[2] + pad
-#     xspan <- as.numeric(xhi - xlo)
-#     xpos <- function(d) ml + (as.numeric(d - xlo) / xspan) * pw
-#     gaps    <- if (length(days_u) > 1) diff(as.numeric(days_u)) else 1
-#     group_w <- max(6, min((min(gaps) / xspan) * pw * 0.85, 46)); sub_w <- group_w / max(ns, 1)
-#     
-#     grid <- paste(vapply(ticks, function(t) {
-#       yy <- mt + ph - (t / ytop) * ph
-#       paste0(sprintf('<line x1="%f" y1="%f" x2="%f" y2="%f" stroke="#e6e6e6"/>', ml, yy, ml + pw, yy),
-#              sprintf('<text x="%f" y="%f" font-size="%d" fill="#555" text-anchor="end" font-family="sans-serif">%s</text>',
-#                      ml - 6, yy + 4, font_size, format(t, big.mark = ",")))
-#     }, character(1)), collapse = "")
-#     axes <- sprintf('<line x1="%f" y1="%f" x2="%f" y2="%f" stroke="#888"/><line x1="%f" y1="%f" x2="%f" y2="%f" stroke="#888"/>',
-#                     ml, mt, ml, mt + ph, ml, mt + ph, ml + pw, mt + ph)
-#     
-#     bars <- paste(vapply(seq_len(nrow(dd)), function(i) {
-#       j <- match(dd$Site[i], sites); if (is.na(j)) return("")
-#       scx <- xpos(dd$day[i]) - group_w / 2 + (j - 0.5) * sub_w
-#       bh  <- (dd$value[i] / ytop) * ph
-#       sprintf('<rect x="%f" y="%f" width="%f" height="%f" fill="%s"/>',
-#               scx - sub_w * 0.45, mt + ph - bh, sub_w * 0.9, bh, unname(site_cols[dd$Site[i]]))
-#     }, character(1)), collapse = "")
-#     
-#     lab_i <- if (length(days_u) <= 10) seq_along(days_u) else
-#       unique(round(seq(1, length(days_u), length.out = 10)))
-#     xlab <- paste(vapply(lab_i, function(i) {
-#       cxx <- xpos(days_u[i])
-#       sprintf('<text x="%f" y="%f" font-size="%d" fill="#555" text-anchor="end" font-family="sans-serif" transform="rotate(-40 %f %f)">%s</text>',
-#               cxx, mt + ph + 14, font_size, cxx, mt + ph + 14, format(days_u[i], "%b %d"))
-#     }, character(1)), collapse = "")
-#     ytitle <- sprintf('<text x="14" y="%f" font-size="%d" fill="#555" text-anchor="middle" font-family="sans-serif" transform="rotate(-90 14 %f)">%s</text>',
-#                       mt + ph / 2, font_size, mt + ph / 2, ylab)
-#     
-#     sprintf('<svg width="%d" height="%d" xmlns="http://www.w3.org/2000/svg">%s%s%s%s%s</svg>',
-#             width, height, grid, axes, bars, xlab, ytitle)
-#   }
-#   
-#   # ---- Hour facets: time of night by species, points coloured by site -------
-#   make_multisite_hour_svg <- function(dd, site_cols, width = 700L,
-#                                       night_start = 20, night_end = 7,
-#                                       panel_h = 380L, panel_gap = 6L, ml = 44L, mr = 10L,
-#                                       strip_h = 17L, xlab_h = 34L, point_r = 2.6, font_size = 11L) {
-#     ylim  <- c(night_start, night_end + 24)
-#     h     <- dd$nh %% 24
-#     dd$nh <- ifelse(h < 12, h + 24, h)
-#     dd    <- dd[!is.na(dd$nh) & dd$nh >= ylim[1] & dd$nh <= ylim[2], , drop = FALSE]
-#     if (nrow(dd) == 0) return('<div style="font-size:13px;color:#666;padding:20px;">No detections between night start and end</div>')
-#     
-#     facs <- unique(dd$facet)
-#     facs <- c(sort(facs[facs != "Unidentified"]), if ("Unidentified" %in% facs) "Unidentified")
-#     nf   <- length(facs)
-#     
-#     panel_w <- max(50L, (width - ml - mr - (nf - 1L) * panel_gap) %/% nf)
-#     total_w <- ml + nf * panel_w + (nf - 1L) * panel_gap + mr
-#     ptop <- strip_h; pbot <- ptop + panel_h; total_h <- pbot + xlab_h
-#     
-#     ud <- sort(unique(dd$x)); xr <- range(ud)
-#     xpad <- max(1, as.numeric(diff(xr)) * 0.08); xlo <- xr[1] - xpad; xspan <- as.numeric(xr[2] + xpad - xlo)
-#     maxlab <- max(2L, panel_w %/% 28L)
-#     if (length(ud) > maxlab) ud <- ud[unique(round(seq(1, length(ud), length.out = maxlab)))]
-#     xpix <- function(d, px0) px0 + 5 + (as.numeric(d - xlo) / xspan) * (panel_w - 10)
-#     ypix <- function(nh) ptop + ((nh - ylim[1]) / diff(ylim)) * panel_h
-#     
-#     yhours <- ylim[1]:ylim[2]
-#     ylabs <- paste(vapply(yhours, function(hh) sprintf(
-#       '<text x="%f" y="%f" font-size="%d" fill="#555" text-anchor="end" font-family="sans-serif">%d:00</text>',
-#       ml - 4, ypix(hh) + 4, font_size, hh %% 24), character(1)), collapse = "")
-#     
-#     panels <- paste(vapply(seq_len(nf), function(k) {
-#       fc <- facs[k]; px0 <- ml + (k - 1L) * (panel_w + panel_gap)
-#       sub <- dd[dd$facet == fc, , drop = FALSE]
-#       bg   <- sprintf('<rect x="%f" y="%f" width="%d" height="%d" fill="#ebebeb"/>', px0, ptop, panel_w, panel_h)
-#       grid <- paste(vapply(yhours, function(hh) sprintf(
-#         '<line x1="%f" y1="%f" x2="%f" y2="%f" stroke="#fff"/>', px0, ypix(hh), px0 + panel_w, ypix(hh)),
-#         character(1)), collapse = "")
-#       strip <- paste0(
-#         sprintf('<rect x="%f" y="0" width="%d" height="%d" fill="#d9d9d9"/>', px0, panel_w, strip_h),
-#         sprintf('<text x="%f" y="%f" font-size="%d" font-weight="bold" fill="#333" text-anchor="middle" font-family="sans-serif">%s</text>',
-#                 px0 + panel_w / 2, strip_h - 4, font_size, htmltools::htmlEscape(fc)))
-#       pts <- paste(sprintf('<circle cx="%f" cy="%f" r="%.1f" fill="%s" fill-opacity="0.75"/>',
-#                            xpix(sub$x, px0), ypix(sub$nh), point_r,
-#                            unname(site_cols[sub$Site])), collapse = "")
-#       xlab <- paste(vapply(ud, function(d) {
-#         cxx <- xpix(d, px0)
-#         sprintf('<text x="%f" y="%f" font-size="9" fill="#555" text-anchor="middle" font-family="sans-serif" transform="rotate(-40 %f %f)">%s</text>',
-#                 cxx, pbot + 12, cxx, pbot + 12, format(d, "%m/%d"))
-#       }, character(1)), collapse = "")
-#       paste0(bg, grid, pts, strip, xlab)
-#     }, character(1)), collapse = "")
-#     
-#     sprintf('<svg width="%d" height="%d" xmlns="http://www.w3.org/2000/svg">%s%s</svg>',
-#             total_w, total_h, ylabs, panels)
-#   }
-#   
-#   # ---- Site -> GRTS cell lookup, straight from merged -----------------------
-#   site_cell <- merged %>%
-#     dplyr::transmute(
-#       Site     = trimws(as.character(Site.Name)),
-#       Site_key = tolower(Site),
-#       Cell     = trimws(as.character(X..GRTS.Cell.Id))
-#     ) %>%
-#     dplyr::filter(!is.na(Site), Site != "", !is.na(Cell), Cell != "") %>%
-#     dplyr::distinct(Site_key, .keep_all = TRUE)
-#   
-#   sd_all  <- site_day %>% dplyr::inner_join(site_cell, by = "Site_key")
-#   pts_all <- df_pts   %>% dplyr::select(-Site) %>% dplyr::inner_join(site_cell, by = "Site_key")
-#   
-#   cells <- unique(site_cell$Cell)
-#   cells <- cells[order(suppressWarnings(as.numeric(cells)), cells)]   # numeric order
-#   if (!is.null(appx_cells)) cells <- cells[cells %in% trimws(as.character(appx_cells))]
-#   trend_ids <- if (exists("trend_grids")) trimws(as.character(trend_grids$GRTS_Cell)) else character(0)
-#   
-#   # jobs = one screenshot each; sections = what gets written to the PDF
-#   jobs <- list(); sections <- list()
-#   add_job <- function(body, file) {
-#     html <- normalizePath(file.path(appx_dir, sub("\\.png$", ".html", file)), mustWork = FALSE)
-#     writeLines(html_page(body), html)
-#     jobs[[length(jobs) + 1]] <<- list(html = html, png = file.path(appx_dir, file))
-#     file.path(appx_dir, file)
-#   }
-#   
-#   for (cell in cells) {
-#     cell_sites <- sort(unique(site_cell$Site[site_cell$Cell == cell]))
-#     cell_keys  <- tolower(cell_sites)
-#     cols <- setNames(site_palette[((seq_along(cell_sites) - 1) %% length(site_palette)) + 1], cell_sites)
-#     tag  <- gsub("[^A-Za-z0-9]+", "_", cell)
-#     
-#     sd_cell  <- sd_all[sd_all$Cell == cell, ]
-#     pts_cell <- pts_all[pts_all$Cell == cell, ]
-#     
-#     yrs <- sort(unique(c(sd_cell$year, pts_cell$year)), decreasing = TRUE)
-#     if (!is.null(appx_years)) yrs <- yrs[yrs %in% appx_years]
-#     if (!length(yrs)) next
-#     
-#     pie_png <- bar_png <- hr_png <- character(0)
-#     for (y in yrs) {
-#       # sites with a detector out that year (zero-detection sites show "No detections")
-#       yr_sites <- cell_sites[cell_keys %in% sd_cell$Site_key[sd_cell$year == y] |
-#                                cell_keys %in% pts_cell$Site_key[pts_cell$year == y]]
-#       
-#       pies <- paste(vapply(yr_sites, function(s) sprintf(
-#         '<div class="pieItem"><div class="pieTitle">%s</div>%s</div>',
-#         htmltools::htmlEscape(s), make_pie_svg(counts_year(tolower(s), y))), character(1)), collapse = "")
-#       pie_png <- c(pie_png, add_job(
-#         sprintf('<div style="width:720px;"><div class="yearHdr">%s</div>%s</div>', y, pies),
-#         sprintf("%s_%s_pies.png", tag, y)))
-#       
-#       sd_cy <- sd_cell[sd_cell$year == y, ]
-#       if (nrow(sd_cy)) bar_png <- c(bar_png, add_job(
-#         sprintf('<div class="yearHdr">%s</div>%s%s', y,
-#                 html_legend(cols[names(cols) %in% sd_cy$Site]),
-#                 make_multisite_bar_svg(sd_cy, cols)),
-#         sprintf("%s_%s_bar.png", tag, y)))
-#       
-#       pts_cy <- pts_cell[pts_cell$year == y, ]
-#       if (nrow(pts_cy)) hr_png <- c(hr_png, add_job(
-#         sprintf('<div class="yearHdr">%s</div>%s%s', y,
-#                 html_legend(cols[names(cols) %in% pts_cy$Site]),
-#                 make_multisite_hour_svg(pts_cy, cols)),
-#         sprintf("%s_%s_hour.png", tag, y)))
-#     }
-#     
-#     sections[[length(sections) + 1]] <- list(
-#       cell = cell, trend = cell %in% trend_ids, years = yrs,
-#       pie = pie_png, bar = bar_png, hr = hr_png)
-#   }
-#   
-#   # ---- Screenshot pages one at a time, skipping ones already made ----------
-#   options(chromote.timeout = 120)
-#   for (j in jobs) {
-#     if (file.exists(j$png)) next          # delete Figures/AppendixB to force a redo
-#     tryCatch(
-#       invisible(utils::capture.output(suppressMessages(
-#         webshot2::webshot(url = j$html, file = j$png,
-#                           selector = ".shot", zoom = 2, delay = 0.2)
-#       ))),
-#       error = function(e) message("Screenshot failed: ", j$png, " -- ", conditionMessage(e))
-#     )
-#   }
-#   
-#   # ---- Write the appendix ---------------------------------------------------
-#   img <- function(p) cat(sprintf("![](%s){width=100%%}\n\n", p))
-#   
-#   cat("# Appendix B\n\n")
-#   cat("Species detection summaries by GRTS grid cell. For each cell, the most recent survey year appears first. ",
-#       "Pie charts show total recordings by species code at each site; bar charts show mean recordings per night ",
-#       "by calendar date for each site (nights with a detector deployed but no recordings count as zero); ",
-#       "the final panels show the time of night of each recording by species, coloured by site.\n\n")
-#   
-#   for (k in seq_along(sections)) {
-#     s <- sections[[k]]
-#     if (k > 1) cat("\n\\newpage\n\n")
-#     cat(sprintf("## Grid cell %s {.unnumbered .unlisted}\n\n", s$cell))
-#     cat(sprintf("Years sampled: %s%s\n\n", paste(s$years, collapse = ", "),
-#                 if (s$trend) " (used in trend analyses)" else ""))
-#     cat("### Species detected {.unnumbered .unlisted}\n\n");        for (p in s$pie) img(p)
-#     if (length(s$bar)) { cat("\n\\newpage\n\n### Nightly activity by site {.unnumbered .unlisted}\n\n"); for (p in s$bar) img(p) }
-#     if (length(s$hr))  { cat("\n\\newpage\n\n### Detection time of night {.unnumbered .unlisted}\n\n");  for (p in s$hr)  img(p) }
-#   }
-# }
+  site_palette <- c("#e41a1c", "#377eb8", "#4daf4a", "#984ea3",
+                    "#ff7f00", "#a65628", "#f781bf", "#666666")
+
+  page_css <- "body{margin:0;padding:12px;background:#fff;font-family:sans-serif;}
+    .shot{display:inline-block;}
+    .yearHdr{font-weight:bold;font-size:16px;color:#2c3e50;border-bottom:2px solid #ccc;margin:0 0 8px;padding-bottom:2px;}
+    .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:#333;margin:0 0 6px 44px;}
+    .legend span{display:inline-flex;align-items:center;gap:5px;}
+    .legend i{display:inline-block;width:11px;height:11px;border-radius:2px;}
+    .pieItem{display:inline-block;vertical-align:top;text-align:center;margin:6px;}
+    .pieTitle{font-weight:bold;font-size:14px;color:#2c3e50;margin-bottom:2px;}"
+
+  html_page <- function(body) sprintf(
+    '<!DOCTYPE html><html><head><meta charset="utf-8"><style>%s</style></head><body><div class="shot">%s</div></body></html>',
+    page_css, body)
+
+  # site legend as HTML so long site names wrap instead of overlapping
+  html_legend <- function(cols) sprintf('<div class="legend">%s</div>',
+                                        paste(sprintf('<span><i style="background:%s"></i>%s</span>',
+                                                      cols, htmltools::htmlEscape(names(cols))), collapse = ""))
+
+  # ---- Bar chart: mean nightly recordings by date, bars dodged by site ------
+  make_multisite_bar_svg <- function(dd, site_cols, width = 700L, height = 330L,
+                                     font_size = 12, ylab = "Recordings / night") {
+    sites <- names(site_cols)[names(site_cols) %in% dd$Site]; ns <- length(sites)
+    ml <- 54; mr <- 16; mt <- 14; mb <- 54
+    pw <- width - ml - mr; ph <- height - mt - mb
+
+    maxv  <- max(dd$value, na.rm = TRUE); if (!is.finite(maxv) || maxv <= 0) maxv <- 1
+    ticks <- pretty(c(0, maxv), n = 5); ytop <- max(ticks)
+
+    days_u <- sort(unique(dd$day)); xr <- range(days_u); span <- as.numeric(diff(xr))
+    pad <- max(1, span * 0.06); xlo <- xr[1] - pad; xhi <- xr[2] + pad
+    xspan <- as.numeric(xhi - xlo)
+    xpos <- function(d) ml + (as.numeric(d - xlo) / xspan) * pw
+    gaps    <- if (length(days_u) > 1) diff(as.numeric(days_u)) else 1
+    group_w <- max(6, min((min(gaps) / xspan) * pw * 0.85, 46)); sub_w <- group_w / max(ns, 1)
+
+    grid <- paste(vapply(ticks, function(t) {
+      yy <- mt + ph - (t / ytop) * ph
+      paste0(sprintf('<line x1="%f" y1="%f" x2="%f" y2="%f" stroke="#e6e6e6"/>', ml, yy, ml + pw, yy),
+             sprintf('<text x="%f" y="%f" font-size="%d" fill="#555" text-anchor="end" font-family="sans-serif">%s</text>',
+                     ml - 6, yy + 4, font_size, format(t, big.mark = ",")))
+    }, character(1)), collapse = "")
+    axes <- sprintf('<line x1="%f" y1="%f" x2="%f" y2="%f" stroke="#888"/><line x1="%f" y1="%f" x2="%f" y2="%f" stroke="#888"/>',
+                    ml, mt, ml, mt + ph, ml, mt + ph, ml + pw, mt + ph)
+
+    bars <- paste(vapply(seq_len(nrow(dd)), function(i) {
+      j <- match(dd$Site[i], sites); if (is.na(j)) return("")
+      scx <- xpos(dd$day[i]) - group_w / 2 + (j - 0.5) * sub_w
+      bh  <- (dd$value[i] / ytop) * ph
+      sprintf('<rect x="%f" y="%f" width="%f" height="%f" fill="%s"/>',
+              scx - sub_w * 0.45, mt + ph - bh, sub_w * 0.9, bh, unname(site_cols[dd$Site[i]]))
+    }, character(1)), collapse = "")
+
+    lab_i <- if (length(days_u) <= 10) seq_along(days_u) else
+      unique(round(seq(1, length(days_u), length.out = 10)))
+    xlab <- paste(vapply(lab_i, function(i) {
+      cxx <- xpos(days_u[i])
+      sprintf('<text x="%f" y="%f" font-size="%d" fill="#555" text-anchor="end" font-family="sans-serif" transform="rotate(-40 %f %f)">%s</text>',
+              cxx, mt + ph + 14, font_size, cxx, mt + ph + 14, format(days_u[i], "%b %d"))
+    }, character(1)), collapse = "")
+    ytitle <- sprintf('<text x="14" y="%f" font-size="%d" fill="#555" text-anchor="middle" font-family="sans-serif" transform="rotate(-90 14 %f)">%s</text>',
+                      mt + ph / 2, font_size, mt + ph / 2, ylab)
+
+    sprintf('<svg width="%d" height="%d" xmlns="http://www.w3.org/2000/svg">%s%s%s%s%s</svg>',
+            width, height, grid, axes, bars, xlab, ytitle)
+  }
+
+  # ---- Hour facets: time of night by species, points coloured by site -------
+  make_multisite_hour_svg <- function(dd, site_cols, width = 700L,
+                                      night_start = 20, night_end = 7,
+                                      panel_h = 380L, panel_gap = 6L, ml = 44L, mr = 10L,
+                                      strip_h = 17L, xlab_h = 34L, point_r = 2.6, font_size = 11L) {
+    ylim  <- c(night_start, night_end + 24)
+    h     <- dd$nh %% 24
+    dd$nh <- ifelse(h < 12, h + 24, h)
+    dd    <- dd[!is.na(dd$nh) & dd$nh >= ylim[1] & dd$nh <= ylim[2], , drop = FALSE]
+    if (nrow(dd) == 0) return('<div style="font-size:13px;color:#666;padding:20px;">No detections between night start and end</div>')
+
+    facs <- unique(dd$facet)
+    facs <- c(sort(facs[facs != "Unidentified"]), if ("Unidentified" %in% facs) "Unidentified")
+    nf   <- length(facs)
+
+    panel_w <- max(50L, (width - ml - mr - (nf - 1L) * panel_gap) %/% nf)
+    total_w <- ml + nf * panel_w + (nf - 1L) * panel_gap + mr
+    ptop <- strip_h; pbot <- ptop + panel_h; total_h <- pbot + xlab_h
+
+    ud <- sort(unique(dd$x)); xr <- range(ud)
+    xpad <- max(1, as.numeric(diff(xr)) * 0.08); xlo <- xr[1] - xpad; xspan <- as.numeric(xr[2] + xpad - xlo)
+    maxlab <- max(2L, panel_w %/% 28L)
+    if (length(ud) > maxlab) ud <- ud[unique(round(seq(1, length(ud), length.out = maxlab)))]
+    xpix <- function(d, px0) px0 + 5 + (as.numeric(d - xlo) / xspan) * (panel_w - 10)
+    ypix <- function(nh) ptop + ((nh - ylim[1]) / diff(ylim)) * panel_h
+
+    yhours <- ylim[1]:ylim[2]
+    ylabs <- paste(vapply(yhours, function(hh) sprintf(
+      '<text x="%f" y="%f" font-size="%d" fill="#555" text-anchor="end" font-family="sans-serif">%d:00</text>',
+      ml - 4, ypix(hh) + 4, font_size, hh %% 24), character(1)), collapse = "")
+
+    panels <- paste(vapply(seq_len(nf), function(k) {
+      fc <- facs[k]; px0 <- ml + (k - 1L) * (panel_w + panel_gap)
+      sub <- dd[dd$facet == fc, , drop = FALSE]
+      bg   <- sprintf('<rect x="%f" y="%f" width="%d" height="%d" fill="#ebebeb"/>', px0, ptop, panel_w, panel_h)
+      grid <- paste(vapply(yhours, function(hh) sprintf(
+        '<line x1="%f" y1="%f" x2="%f" y2="%f" stroke="#fff"/>', px0, ypix(hh), px0 + panel_w, ypix(hh)),
+        character(1)), collapse = "")
+      strip <- paste0(
+        sprintf('<rect x="%f" y="0" width="%d" height="%d" fill="#d9d9d9"/>', px0, panel_w, strip_h),
+        sprintf('<text x="%f" y="%f" font-size="%d" font-weight="bold" fill="#333" text-anchor="middle" font-family="sans-serif">%s</text>',
+                px0 + panel_w / 2, strip_h - 4, font_size, htmltools::htmlEscape(fc)))
+      pts <- paste(sprintf('<circle cx="%f" cy="%f" r="%.1f" fill="%s" fill-opacity="0.75"/>',
+                           xpix(sub$x, px0), ypix(sub$nh), point_r,
+                           unname(site_cols[sub$Site])), collapse = "")
+      xlab <- paste(vapply(ud, function(d) {
+        cxx <- xpix(d, px0)
+        sprintf('<text x="%f" y="%f" font-size="9" fill="#555" text-anchor="middle" font-family="sans-serif" transform="rotate(-40 %f %f)">%s</text>',
+                cxx, pbot + 12, cxx, pbot + 12, format(d, "%m/%d"))
+      }, character(1)), collapse = "")
+      paste0(bg, grid, pts, strip, xlab)
+    }, character(1)), collapse = "")
+
+    sprintf('<svg width="%d" height="%d" xmlns="http://www.w3.org/2000/svg">%s%s</svg>',
+            total_w, total_h, ylabs, panels)
+  }
+
+  # ---- Site -> GRTS cell lookup, straight from merged -----------------------
+  site_cell <- merged %>%
+    dplyr::transmute(
+      Site     = trimws(as.character(Site.Name)),
+      Site_key = tolower(Site),
+      Cell     = trimws(as.character(X..GRTS.Cell.Id))
+    ) %>%
+    dplyr::filter(!is.na(Site), Site != "", !is.na(Cell), Cell != "") %>%
+    dplyr::distinct(Site_key, .keep_all = TRUE)
+
+  sd_all  <- site_day %>% dplyr::inner_join(site_cell, by = "Site_key")
+  pts_all <- df_pts   %>% dplyr::select(-Site) %>% dplyr::inner_join(site_cell, by = "Site_key")
+
+  cells <- unique(site_cell$Cell)
+  cells <- cells[order(suppressWarnings(as.numeric(cells)), cells)]   # numeric order
+  if (!is.null(appx_cells)) cells <- cells[cells %in% trimws(as.character(appx_cells))]
+  trend_ids <- if (exists("trend_grids")) trimws(as.character(trend_grids$GRTS_Cell)) else character(0)
+
+  # jobs = one screenshot each; sections = what gets written to the PDF
+  jobs <- list(); sections <- list()
+  add_job <- function(body, file) {
+    png <- file.path(appx_dir, file)
+    if (!file.exists(png)) {          # only build a page if the PNG is missing
+      html <- tempfile(fileext = ".html")  # lives in R's temp folder, not Figures/
+      writeLines(html_page(body), html)
+      jobs[[length(jobs) + 1]] <<- list(html = html, png = png)
+    }
+    png
+  }
+
+  for (cell in cells) {
+    cell_sites <- sort(unique(site_cell$Site[site_cell$Cell == cell]))
+    cell_keys  <- tolower(cell_sites)
+    cols <- setNames(site_palette[((seq_along(cell_sites) - 1) %% length(site_palette)) + 1], cell_sites)
+    tag  <- gsub("[^A-Za-z0-9]+", "_", cell)
+
+    sd_cell  <- sd_all[sd_all$Cell == cell, ]
+    pts_cell <- pts_all[pts_all$Cell == cell, ]
+
+    yrs <- sort(unique(c(sd_cell$year, pts_cell$year)), decreasing = TRUE)
+    if (!is.null(appx_years)) yrs <- yrs[yrs %in% appx_years]
+    if (!length(yrs)) next
+
+    pie_png <- bar_png <- hr_png <- character(0)
+    for (y in yrs) {
+      # sites with a detector out that year (zero-detection sites show "No detections")
+      yr_sites <- cell_sites[cell_keys %in% sd_cell$Site_key[sd_cell$year == y] |
+                               cell_keys %in% pts_cell$Site_key[pts_cell$year == y]]
+
+      pies <- paste(vapply(yr_sites, function(s) sprintf(
+        '<div class="pieItem"><div class="pieTitle">%s</div>%s</div>',
+        htmltools::htmlEscape(s), make_pie_svg(counts_year(tolower(s), y))), character(1)), collapse = "")
+      pie_png <- c(pie_png, add_job(
+        sprintf('<div style="width:720px;"><div class="yearHdr">%s</div>%s</div>', y, pies),
+        sprintf("%s_%s_pies.png", tag, y)))
+
+      sd_cy <- sd_cell[sd_cell$year == y, ]
+      if (nrow(sd_cy)) bar_png <- c(bar_png, add_job(
+        sprintf('<div class="yearHdr">%s</div>%s%s', y,
+                html_legend(cols[names(cols) %in% sd_cy$Site]),
+                make_multisite_bar_svg(sd_cy, cols)),
+        sprintf("%s_%s_bar.png", tag, y)))
+
+      pts_cy <- pts_cell[pts_cell$year == y, ]
+      if (nrow(pts_cy)) hr_png <- c(hr_png, add_job(
+        sprintf('<div class="yearHdr">%s</div>%s%s', y,
+                html_legend(cols[names(cols) %in% pts_cy$Site]),
+                make_multisite_hour_svg(pts_cy, cols)),
+        sprintf("%s_%s_hour.png", tag, y)))
+    }
+
+    sections[[length(sections) + 1]] <- list(
+      cell = cell, trend = cell %in% trend_ids, years = yrs,
+      pie = pie_png, bar = bar_png, hr = hr_png)
+  }
+
+  # ---- Screenshot pages one at a time, skipping ones already made ----------
+  options(chromote.timeout = 120)
+  for (j in jobs) {
+    tryCatch(
+      invisible(utils::capture.output(suppressMessages(
+        webshot2::webshot(url = j$html, file = j$png,
+                          selector = ".shot", zoom = 2, delay = 0.2)
+      ))),
+      error = function(e) message("Screenshot failed: ", j$png, " -- ", conditionMessage(e))
+    )
+    unlink(j$html)                                # remove the temporary HTML
+  }
+
+  # ---- Write the appendix ---------------------------------------------------
+  img <- function(p) cat(sprintf("![](%s){width=100%%}\n\n", p))
+
+  cat("# Appendix B\n\n")
+  cat("Species detection summaries by GRTS grid cell. For each cell that has at least 5 years of data, the most recent survey year appears first. ",
+      "Pie charts show total recordings by species code at each site; bar charts show mean recordings per night ",
+      "by calendar date for each site (nights with a detector deployed but no recordings count as zero); ",
+      "the final panels show the time of night of each recording by species, coloured by site.\n\n")
+
+  for (k in seq_along(sections)) {
+    s <- sections[[k]]
+    if (k > 1) cat("\n\\newpage\n\n")
+    cat(sprintf("## Grid cell %s {.unnumbered .unlisted}\n\n", s$cell))
+    cat(sprintf("Years sampled: %s%s\n\n", paste(s$years, collapse = ", "),
+                if (s$trend) " (used in trend analyses)" else ""))
+    cat("### Species detected {.unnumbered .unlisted}\n\n");        for (p in s$pie) img(p)
+    if (length(s$bar)) { cat("\n\\newpage\n\n### Nightly activity by site {.unnumbered .unlisted}\n\n"); for (p in s$bar) img(p) }
+    if (length(s$hr))  { cat("\n\\newpage\n\n### Detection time of night {.unnumbered .unlisted}\n\n");  for (p in s$hr)  img(p) }
+  }
+}
 ```
 
 {{< pagebreak >}}
